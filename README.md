@@ -159,13 +159,66 @@ FROM timescaledb_information.hypertables;
 
 ---
 
-## 🛠️ Production में 24×7 चलाने के लिए
+## 🖥️ Same-Server Deployment (सब कुछ एक ही machine पर)
 
-**systemd service** (`/etc/systemd/system/tick-recorder.service`):
+अगर **OpenAlgo + TimescaleDB + recorder** तीनों एक ही server पर चलाने हैं
+(typical VPS setup), तो default `.env` values में **कुछ बदलने की ज़रूरत नहीं** —
+सब कुछ `127.0.0.1` पर ही point करता है।
+
+### Port map
+| Service | Port | Bind |
+|---|---|---|
+| PostgreSQL / TimescaleDB | 5432 | localhost |
+| OpenAlgo HTTP / REST | 5000 | localhost |
+| OpenAlgo WebSocket | 8765 | localhost |
+| `tick_recorder.py` | — (client only) | — |
+
+> सुरक्षा के लिए OpenAlgo और Postgres को **localhost** पर ही रखें (firewall से
+> public access block करें)। Loopback connections fastest भी हैं — कोई network
+> latency नहीं।
+
+### Resource estimate (same server)
+| | RAM | Disk | CPU |
+|---|---|---|---|
+| OpenAlgo | ~400 MB | — | 1 core idle |
+| TimescaleDB | ~1 GB | ~150 MB/day (compressed) | 1 core |
+| Recorder | ~100 MB | — | 0.2 core |
+| **Total (recommended)** | **2 vCPU / 4 GB / 50 GB SSD** बहुत है | | |
+
+### Startup order (बहुत ज़रूरी)
+```
+PostgreSQL  →  OpenAlgo  →  tick_recorder.py
+```
+recorder पहले चालू होकर crash-loop में जाएगा अगर OpenAlgo अभी up नहीं है — इसलिए
+systemd में dependency declare करना ज़रूरी है।
+
+### Production में 24×7 चलाने के लिए — systemd
+
+**1) OpenAlgo service** (`/etc/systemd/system/openalgo.service`):
+```ini
+[Unit]
+Description=OpenAlgo Server
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openalgo
+ExecStart=/home/ubuntu/openalgo/.venv/bin/python app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**2) Recorder service** (`/etc/systemd/system/tick-recorder.service`):
 ```ini
 [Unit]
 Description=OpenAlgo Tick Recorder
-After=network.target postgresql.service
+After=network.target postgresql.service openalgo.service
+Requires=postgresql.service openalgo.service
 
 [Service]
 Type=simple
@@ -173,18 +226,28 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/Trading-TimescaleDB-Short-1
 ExecStart=/home/ubuntu/Trading-TimescaleDB-Short-1/.venv/bin/python tick_recorder.py
 Restart=always
-RestartSec=10
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+**3) Enable + start:**
 ```bash
-sudo systemctl enable --now tick-recorder
+sudo systemctl daemon-reload
+sudo systemctl enable --now postgresql openalgo tick-recorder
 sudo journalctl -u tick-recorder -f      # live logs
 ```
 
-Crash हो जाए तो `Restart=always` अपने आप दोबारा शुरू कर देगा। Pre/post-market के
-hours में recorder को रोकने के लिए **cron + `systemctl start/stop`** लगा सकते हैं।
+`Requires=` लगाने से reboot पर भी सही order में सब उठेंगे। OpenAlgo crash होने
+पर recorder भी अपने आप restart होगा (built-in WS reconnect logic इसे smooth
+handle कर लेगा)।
+
+Pre/post-market hours में recorder को रोकने के लिए **cron**:
+```cron
+15 9  * * 1-5  systemctl start tick-recorder
+45 15 * * 1-5  systemctl stop  tick-recorder
+```
 
 ---
 
