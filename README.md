@@ -127,10 +127,46 @@ Script में **तीन-स्तरीय (3-layer)** safety है:
   process clean exit करता है — कोई data loss नहीं।
 
 > **तो data loss कब हो सकता है?**
-> सिर्फ़ उन seconds का जब broker → OpenAlgo की link भी टूटी हो *और* आपका
-> recorder भी बंद हो। Live ticks का nature ही ऐसा है — broker उन्हें replay नहीं
-> करता। **Historical gap भरने** के लिए OpenAlgo का `client.history(...)` REST
-> endpoint use करके आप बाद में 1-min/5-min OHLCV backfill कर सकते हैं।
+> सिर्फ़ उन seconds का जब OpenAlgo *और* recorder **दोनों एक साथ बंद हों** (server
+> reboot, OpenAlgo crash, power cut)। उस window की **live ticks lost हो जाती हैं**
+> क्योंकि broker उन्हें replay नहीं करता। उन्हें भरने के लिए ⤵
+
+---
+
+## 🩹 Gap Recovery — `backfill.py`
+
+जब दोनों एक साथ नीचे थे, उस window का **1-minute OHLCV** OpenAlgo के REST
+`history()` API से लाकर `bars_1m` hypertable में भर देती है। यह 100% safe है —
+`ON CONFLICT DO NOTHING` लगा है, इसलिए जितनी बार चलाएँ, duplicates नहीं बनेंगे।
+
+```bash
+# Recorder restart होने के तुरंत बाद चलाएँ — last gap अपने आप detect होगा
+python backfill.py
+
+# पिछले 3 दिन का data force-fill करना है?
+python backfill.py --days 3
+
+# सिर्फ़ एक symbol के लिए?
+python backfill.py --symbol RELIANCE
+```
+
+**कैसे काम करता है:**
+1. हर symbol का `bars_1m` में *last timestamp* पढ़ता है
+2. वहाँ से अब तक का 1-min OHLCV broker से REST API के ज़रिए मँगवाता है
+3. `bars_1m` में insert (primary key duplicate-safe)
+
+**दो tables क्यों?**
+| Table | किससे भरती है | Resolution | कब use करें |
+|---|---|---|---|
+| `ticks` | live WebSocket (real-time) | per-second | live monitoring, micro-strategies |
+| `bars_1m` | REST history (gap-fill / EOD reconcile) | 1-minute | backtesting, gap recovery |
+
+> **Tip:** systemd से `tick-recorder` के साथ ही एक छोटा daily cron लगा दें जो
+> `backfill.py` को market close के बाद चलाए — हर रात आपका 1-min OHLCV भी
+> consistent रहेगा।
+> ```cron
+> 30 16 * * 1-5  cd /home/ubuntu/Trading-TimescaleDB-Short-1 && .venv/bin/python backfill.py
+> ```
 
 ---
 
@@ -219,29 +255,56 @@ WantedBy=multi-user.target
 Description=OpenAlgo Tick Recorder
 After=network.target postgresql.service openalgo.service
 Requires=postgresql.service openalgo.service
+PartOf=openalgo.service        # OpenAlgo बंद → recorder भी बंद (एक साथ)
+BindsTo=openalgo.service       # OpenAlgo crash → recorder भी रुक जाए
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/Trading-TimescaleDB-Short-1
 ExecStart=/home/ubuntu/Trading-TimescaleDB-Short-1/.venv/bin/python tick_recorder.py
+ExecStartPost=/bin/bash -c 'sleep 30 && /home/ubuntu/Trading-TimescaleDB-Short-1/.venv/bin/python /home/ubuntu/Trading-TimescaleDB-Short-1/backfill.py || true'
 Restart=always
 RestartSec=15
+KillSignal=SIGINT              # graceful shutdown — pending buffer DB में flush होगा
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-**3) Enable + start:**
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now postgresql openalgo tick-recorder
-sudo journalctl -u tick-recorder -f      # live logs
+**3) (Optional) एक `target` से दोनों को एक साथ start/stop करें**
+`/etc/systemd/system/tick-pipeline.target`:
+```ini
+[Unit]
+Description=Tick Pipeline (OpenAlgo + Recorder)
+Requires=openalgo.service tick-recorder.service
+After=openalgo.service tick-recorder.service
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-`Requires=` लगाने से reboot पर भी सही order में सब उठेंगे। OpenAlgo crash होने
-पर recorder भी अपने आप restart होगा (built-in WS reconnect logic इसे smooth
-handle कर लेगा)।
+**4) Enable + start:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now postgresql openalgo tick-recorder tick-pipeline.target
+sudo journalctl -u tick-recorder -f      # live logs
+
+# एक command से दोनों बंद / चालू:
+sudo systemctl stop  tick-pipeline.target
+sudo systemctl start tick-pipeline.target
+```
+
+**ये क्या करते हैं?**
+
+| Directive | असर |
+|---|---|
+| `Requires=` | reboot पर सही order में उठाता है |
+| `PartOf=` | `systemctl stop openalgo` → recorder अपने आप रुकेगा |
+| `BindsTo=` | OpenAlgo crash → recorder भी stop (कोई dead WS retry-storm नहीं) |
+| `KillSignal=SIGINT` | recorder को graceful stop — pending buffer **DB में flush** होगा |
+| `ExecStartPost` | recorder restart के 30s बाद **`backfill.py` अपने आप चलकर gap भर देगा** ⭐ |
 
 Pre/post-market hours में recorder को रोकने के लिए **cron**:
 ```cron

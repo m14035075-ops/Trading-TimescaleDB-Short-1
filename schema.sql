@@ -62,6 +62,27 @@ CREATE INDEX IF NOT EXISTS idx_depth_symbol_time
     ON depth (exchange, symbol, time DESC);
 
 -- -------------------------------------------------------------
+-- 2b) bars_1m  → backfill के लिए 1-minute OHLCV (REST history API से)
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bars_1m (
+    time      TIMESTAMPTZ      NOT NULL,
+    exchange  TEXT             NOT NULL,
+    symbol    TEXT             NOT NULL,
+    open      DOUBLE PRECISION,
+    high      DOUBLE PRECISION,
+    low       DOUBLE PRECISION,
+    close     DOUBLE PRECISION,
+    volume    BIGINT,
+    PRIMARY KEY (exchange, symbol, time)         -- duplicate insert safe
+);
+
+SELECT create_hypertable(
+    'bars_1m', 'time',
+    chunk_time_interval => INTERVAL '7 days',
+    if_not_exists       => TRUE
+);
+
+-- -------------------------------------------------------------
 -- 3) Compression  → 7 दिन पुराने chunks compress होंगे (~10x कम जगह)
 -- -------------------------------------------------------------
 ALTER TABLE ticks SET (
@@ -77,6 +98,13 @@ ALTER TABLE depth SET (
     timescaledb.compress_orderby   = 'time DESC'
 );
 SELECT add_compression_policy('depth', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE bars_1m SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, symbol',
+    timescaledb.compress_orderby   = 'time DESC'
+);
+SELECT add_compression_policy('bars_1m', INTERVAL '30 days', if_not_exists => TRUE);
 
 -- -------------------------------------------------------------
 -- 4) Retention (optional) — 180 दिन के बाद auto-delete
